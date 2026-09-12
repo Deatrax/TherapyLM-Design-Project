@@ -69,15 +69,15 @@ from llm_zero_shot_eval import CATEGORIES, stratified_sample
 LM_STUDIO_BASE_URL = "http://192.168.68.100:1234/v1"
 
 PROVIDERS = {
-    "gpt-6-astra": {
+    "gpt-5.6-sol": {
         "type": "openai_compat", "base_url": None, "api_key_env": "OPENAI_API_KEY",
-        "use_json_mode": True, "family": "OpenAI",
+        "use_json_mode": True, "supports_temperature": False, "family": "OpenAI",
     },
     "gpt-5.6-terra": {
         "type": "openai_compat", "base_url": None, "api_key_env": "OPENAI_API_KEY",
-        "use_json_mode": True, "family": "OpenAI",
+        "use_json_mode": True, "supports_temperature": False, "family": "OpenAI",
     },
-    "gemini-3.1-pro": {
+    "gemini-3.1-pro-preview": {
         "type": "vertex", "api_key_env": "GOOGLE_VERTEX_API_KEY", "family": "Google",
     },
     "gemini-3.6-flash": {
@@ -105,6 +105,15 @@ SYSTEM_PROMPT = (
     '{"label": "<one of the seven categories, spelled exactly as given>", '
     '"rationale": "<one short sentence>"}'
 )
+
+# Some models (typically "reasoning"-style ones) reject a custom temperature
+# entirely and only support their fixed default. Retrying the identical
+# request against a model like that can never succeed -- it's a deterministic
+# 400, not a transient failure -- so once we learn a model rejects it, we
+# remember that for the rest of the run and stop sending it. This is a
+# process-lifetime cache, not per-call: discovering it once (e.g. during a
+# 5-post smoke test) means the full 500-post run never has to rediscover it.
+_no_temperature_support = set()
 
 
 def _extract_json(text: str):
@@ -154,7 +163,7 @@ def get_openai_client_for(model_key: str) -> OpenAI:
     return OpenAI(**kwargs)
 
 
-def classify_post_openai_compat(client, model, post_text, use_json_mode=True, max_retries=4):
+def classify_post_openai_compat(client, model, post_text, use_json_mode=True, supports_temperature=True, max_retries=4):
     """Classify one post via the openai client -- used for OpenAI itself and
     for LM Studio (both are genuinely OpenAI-compatible)."""
     for attempt in range(max_retries):
@@ -165,8 +174,9 @@ def classify_post_openai_compat(client, model, post_text, use_json_mode=True, ma
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": str(post_text)[:4000]},
                 ],
-                temperature=0.1,
             )
+            if supports_temperature and model not in _no_temperature_support:
+                kwargs["temperature"] = 0.1
             if use_json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
             response = client.chat.completions.create(**kwargs)
@@ -177,6 +187,12 @@ def classify_post_openai_compat(client, model, post_text, use_json_mode=True, ma
             out_tok = getattr(usage, "completion_tokens", None) if usage else None
             return label, rationale, in_tok, out_tok
         except Exception as e:
+            err_str = str(e).lower()
+            if "temperature" in err_str and "does not support" in err_str and model not in _no_temperature_support:
+                _no_temperature_support.add(model)
+                print(f"    [{model}] this model doesn't support a custom temperature -- "
+                      f"switching to its default for the rest of the run", file=sys.stderr)
+                continue   # retry immediately with temperature dropped, no backoff needed
             wait = 2 ** attempt
             print(f"    [{model}] retry {attempt + 1}/{max_retries} after error: {e} (waiting {wait}s)", file=sys.stderr)
             time.sleep(wait)
@@ -227,7 +243,11 @@ def classify_post_dispatch(model_key, post_text, openai_client=None):
     cfg = PROVIDERS[model_key]
     if cfg["type"] == "vertex":
         return classify_post_vertex(model_key, post_text)
-    return classify_post_openai_compat(openai_client, model_key, post_text, use_json_mode=cfg["use_json_mode"])
+    return classify_post_openai_compat(
+        openai_client, model_key, post_text,
+        use_json_mode=cfg["use_json_mode"],
+        supports_temperature=cfg.get("supports_temperature", True),
+    )
 
 
 def run_multi_model_eval(
