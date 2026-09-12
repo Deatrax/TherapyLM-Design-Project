@@ -2,25 +2,37 @@
 multi_llm_eval.py  --  Multi-model, multi-family LLM comparison
 
 Evaluates the SAME stratified sample of posts across multiple LLMs spanning
-three families (OpenAI, Google Gemini, and a locally-run open-weights model),
-directly addressing the paper's own limitation of using only one LLM.
+three families (OpenAI, Google Gemini via Vertex AI trial credits, and
+locally-run open-weights models via LM Studio), directly addressing the
+paper's own limitation of using only one LLM.
 
-KEY ARCHITECTURAL FACT THIS RELIES ON: Gemini exposes an OpenAI-compatible
-endpoint (generativelanguage.googleapis.com/v1beta/openai/), and Ollama
-(the standard way to run local models) does too. So this file uses ONE
-universal function against the `openai` Python client for all three
-providers -- only `base_url` and `api_key` change per provider, not the
-calling code. This is the entire reason this file is short.
+TWO REQUEST PATHS, NOT ONE -- this is a change from an earlier version of
+this file. Originally every provider went through one universal OpenAI-client
+call (base_url swap only). That still works for OpenAI itself and for LM
+Studio (both are genuinely OpenAI-compatible with simple/no auth). But Gemini
+is different here: your Google Cloud trial credits only pay for calls made
+through Vertex AI's NATIVE REST endpoint with a plain API key
+(aiplatform.googleapis.com .../generateContent?key=...). Vertex's own
+OpenAI-compatible layer exists too, but needs OAuth/Bearer-token auth rather
+than a simple key -- more setup than what's already proven to work for you.
+So Gemini gets its own request function (classify_post_vertex) using
+`requests` directly, while OpenAI and LM Studio share the `openai` client
+path (classify_post_openai_compat) via a `type` field in PROVIDERS.
 
 Written to be IMPORTED from a notebook. Standalone CLI use also works:
     python multi_llm_eval.py --input data/processed/test.csv
 
 SETUP
     1. OpenAI: OPENAI_API_KEY in .env (already set up if you did Step 3)
-    2. Gemini: GEMINI_API_KEY in .env (get one free at aistudio.google.com)
-    3. Local: install Ollama (ollama.com), then:
-         ollama pull llama3.1:8b
-       Ollama runs its own local server automatically after install; no key needed.
+    2. Gemini/Vertex: GOOGLE_VERTEX_API_KEY in .env -- from a Google Cloud
+       $300-trial project (console.cloud.google.com/freetrial), API key
+       generated under APIs & Services -> Credentials, with the Vertex AI /
+       Agent Platform API enabled and allowed on that key.
+    3. Local (LM Studio): load your model(s) in LM Studio, start its local
+       server, and make sure it's reachable at LM_STUDIO_BASE_URL below (a
+       LAN IP:port if it's running on another machine, e.g. your dad's Mac --
+       LM Studio's server must be bound to 0.0.0.0, not just localhost, for
+       another machine to reach it). No API key needed.
 
 OUTPUT
     results/tables/multi_llm_<model>.csv   one file per model
@@ -36,6 +48,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 from openai import OpenAI
 from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
@@ -45,47 +58,40 @@ try:
 except ImportError:
     tqdm = None
 
-# Reuse the exact same categories and sampling logic already tested in Step 3,
-# so this evaluates on a genuinely comparable set of posts.
 from llm_zero_shot_eval import CATEGORIES, stratified_sample
 
 # ============================================================================
-# Provider configuration -- this table is the only per-provider "code" needed.
-# Add/remove/rename models by editing this dict; nothing else needs to change.
+# Provider configuration
 # ============================================================================
+# LM Studio's server address -- update this if it changes. Point it at the
+# machine actually running LM Studio (a LAN IP if that's a different machine
+# from the one running this notebook).
+LM_STUDIO_BASE_URL = "http://192.168.68.100:1234/v1"
+
 PROVIDERS = {
-    "gpt-6-astra": {
-        "base_url": None,                 # None = OpenAI's default endpoint
-        "api_key_env": "OPENAI_API_KEY",
-        "use_json_mode": True,            # OpenAI reliably honors response_format
-        "family": "OpenAI",
+    "gpt-5.6-sol": {
+        "type": "openai_compat", "base_url": None, "api_key_env": "OPENAI_API_KEY",
+        "use_json_mode": True, "supports_temperature": False, "family": "OpenAI",
     },
     "gpt-5.6-terra": {
-        "base_url": None,
-        "api_key_env": "OPENAI_API_KEY",
-        "use_json_mode": True,
-        "family": "OpenAI",
+        "type": "openai_compat", "base_url": None, "api_key_env": "OPENAI_API_KEY",
+        "use_json_mode": True, "supports_temperature": False, "family": "OpenAI",
     },
-    "gemini-3.1-pro": {
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "api_key_env": "GEMINI_API_KEY",
-        "use_json_mode": True,
-        "family": "Google",
+    "gemini-3.1-pro-preview": {
+        "type": "vertex", "api_key_env": "GOOGLE_VERTEX_API_KEY", "family": "Google",
     },
     "gemini-3.6-flash": {
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "api_key_env": "GEMINI_API_KEY",
-        "use_json_mode": True,
-        "family": "Google",
+        "type": "vertex", "api_key_env": "GOOGLE_VERTEX_API_KEY", "family": "Google",
     },
-    "llama3.1:8b": {
-        "base_url": "http://localhost:11434/v1",
-        "api_key_env": None,              # Ollama ignores the key; any string works
-        "use_json_mode": False,           # safer default: not every Ollama/model combo
-                                           # reliably honors response_format via the
-                                           # compat layer -- rely on prompt + robust
-                                           # parsing instead for the local model
-        "family": "Local (Ollama)",
+    "meta-llama-3.1-8b-instruct": {
+        "type": "openai_compat", "base_url": LM_STUDIO_BASE_URL, "api_key_env": None,
+        "use_json_mode": False,   # safer default via a local server's compat layer
+        "family": "Local (LM Studio)",
+    },
+    "google/gemma-4b-e4b": {
+        "type": "openai_compat", "base_url": LM_STUDIO_BASE_URL, "api_key_env": None,
+        "use_json_mode": False,
+        "family": "Local (LM Studio)",
     },
 }
 
@@ -100,31 +106,19 @@ SYSTEM_PROMPT = (
     '"rationale": "<one short sentence>"}'
 )
 
-
-def get_client_for(model_key: str) -> OpenAI:
-    """Build the right client for whichever provider this model belongs to.
-    This is the ENTIRE multi-provider abstraction -- everything downstream
-    just calls client.chat.completions.create() the same way regardless."""
-    cfg = PROVIDERS[model_key]
-    if cfg["api_key_env"]:
-        api_key = os.environ.get(cfg["api_key_env"])
-        if not api_key:
-            raise RuntimeError(f"{cfg['api_key_env']} not set in .env -- needed for {model_key}")
-    else:
-        api_key = "not-needed-for-local-ollama"   # Ollama doesn't check this
-    kwargs = {"api_key": api_key}
-    if cfg["base_url"]:
-        kwargs["base_url"] = cfg["base_url"]
-    return OpenAI(**kwargs)
+# Some models (typically "reasoning"-style ones) reject a custom temperature
+# entirely and only support their fixed default. Retrying the identical
+# request against a model like that can never succeed -- it's a deterministic
+# 400, not a transient failure -- so once we learn a model rejects it, we
+# remember that for the rest of the run and stop sending it. This is a
+# process-lifetime cache, not per-call: discovering it once (e.g. during a
+# 5-post smoke test) means the full 500-post run never has to rediscover it.
+_no_temperature_support = set()
 
 
 def _extract_json(text: str):
-    """
-    Robust JSON extraction that doesn't assume the provider perfectly honored
-    response_format. Handles: clean JSON, JSON wrapped in ```...``` fences
-    (common local-model habit), and JSON with stray prose around it.
-    Returns a dict, or None if nothing parseable was found.
-    """
+    """Robust JSON extraction -- handles clean JSON, ```-fenced JSON, and JSON
+    with stray prose around it. Returns a dict, or None if unparseable."""
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
     try:
@@ -140,15 +134,38 @@ def _extract_json(text: str):
     return None
 
 
-def classify_post_universal(client, model, post_text, use_json_mode=True, max_retries=4):
-    """
-    Classify one post with one model, retrying with backoff. Works identically
-    for OpenAI, Gemini (via its OpenAI-compat endpoint), and a local Ollama
-    model -- the only thing that ever differs is which `client` was passed in.
+def _normalize_label(data):
+    """Pull a validated label + rationale out of a parsed JSON dict, or raise."""
+    if not data or "label" not in data:
+        raise ValueError(f"no parseable JSON label in: {data!r}")
+    label = data["label"]
+    if label not in CATEGORIES:
+        normalized = next((c for c in CATEGORIES if c.lower().strip(" .") == str(label).lower().strip(" .")), None)
+        if normalized is None:
+            raise ValueError(f"label {label!r} isn't one of the 7 categories")
+        label = normalized
+    return label, data.get("rationale", "")
 
-    Returns (label, rationale, input_tokens, output_tokens), or all-None if
-    every retry fails.
-    """
+
+def get_openai_client_for(model_key: str) -> OpenAI:
+    """Build an `openai` client for an 'openai_compat' provider (OpenAI itself
+    or LM Studio) -- only base_url/api_key differ."""
+    cfg = PROVIDERS[model_key]
+    if cfg["api_key_env"]:
+        api_key = os.environ.get(cfg["api_key_env"])
+        if not api_key:
+            raise RuntimeError(f"{cfg['api_key_env']} not set in .env -- needed for {model_key}")
+    else:
+        api_key = "not-needed-for-local-lm-studio"
+    kwargs = {"api_key": api_key}
+    if cfg["base_url"]:
+        kwargs["base_url"] = cfg["base_url"]
+    return OpenAI(**kwargs)
+
+
+def classify_post_openai_compat(client, model, post_text, use_json_mode=True, supports_temperature=True, max_retries=4):
+    """Classify one post via the openai client -- used for OpenAI itself and
+    for LM Studio (both are genuinely OpenAI-compatible)."""
     for attempt in range(max_retries):
         try:
             kwargs = dict(
@@ -157,35 +174,80 @@ def classify_post_universal(client, model, post_text, use_json_mode=True, max_re
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": str(post_text)[:4000]},
                 ],
-                temperature=0.1,
             )
+            if supports_temperature and model not in _no_temperature_support:
+                kwargs["temperature"] = 0.1
             if use_json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
             response = client.chat.completions.create(**kwargs)
             content = response.choices[0].message.content
-            data = _extract_json(content)
-            if not data or "label" not in data:
-                raise ValueError(f"no parseable JSON label in response: {content[:150]!r}")
-
-            label = data["label"]
-            if label not in CATEGORIES:
-                # local/smaller models sometimes vary case or add punctuation --
-                # try a forgiving match before treating it as a real failure
-                normalized = next((c for c in CATEGORIES if c.lower().strip(" .") == str(label).lower().strip(" .")), None)
-                if normalized is None:
-                    raise ValueError(f"label {label!r} isn't one of the 7 categories")
-                label = normalized
-
-            rationale = data.get("rationale", "")
+            label, rationale = _normalize_label(_extract_json(content))
             usage = getattr(response, "usage", None)
             in_tok = getattr(usage, "prompt_tokens", None) if usage else None
             out_tok = getattr(usage, "completion_tokens", None) if usage else None
+            return label, rationale, in_tok, out_tok
+        except Exception as e:
+            err_str = str(e).lower()
+            if "temperature" in err_str and "does not support" in err_str and model not in _no_temperature_support:
+                _no_temperature_support.add(model)
+                print(f"    [{model}] this model doesn't support a custom temperature -- "
+                      f"switching to its default for the rest of the run", file=sys.stderr)
+                continue   # retry immediately with temperature dropped, no backoff needed
+            wait = 2 ** attempt
+            print(f"    [{model}] retry {attempt + 1}/{max_retries} after error: {e} (waiting {wait}s)", file=sys.stderr)
+            time.sleep(wait)
+    return None, None, None, None
+
+
+def classify_post_vertex(model, post_text, max_retries=4):
+    """
+    Classify one post via Vertex AI's NATIVE generateContent REST endpoint --
+    this is the path your $300 trial credit actually bills against. Uses
+    Gemini's own generationConfig.responseMimeType for JSON mode (a native
+    Gemini feature, unrelated to OpenAI's response_format).
+    """
+    api_key = os.environ.get("GOOGLE_VERTEX_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_VERTEX_API_KEY not set in .env")
+
+    url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": str(post_text)[:4000]}]}],
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(url, json=payload, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            label, rationale = _normalize_label(_extract_json(text))
+            usage = data.get("usageMetadata", {})
+            in_tok = usage.get("promptTokenCount")
+            out_tok = usage.get("candidatesTokenCount")
             return label, rationale, in_tok, out_tok
         except Exception as e:
             wait = 2 ** attempt
             print(f"    [{model}] retry {attempt + 1}/{max_retries} after error: {e} (waiting {wait}s)", file=sys.stderr)
             time.sleep(wait)
     return None, None, None, None
+
+
+def classify_post_dispatch(model_key, post_text, openai_client=None):
+    """Route to the right classify function based on PROVIDERS[model_key]['type']."""
+    cfg = PROVIDERS[model_key]
+    if cfg["type"] == "vertex":
+        return classify_post_vertex(model_key, post_text)
+    return classify_post_openai_compat(
+        openai_client, model_key, post_text,
+        use_json_mode=cfg["use_json_mode"],
+        supports_temperature=cfg.get("supports_temperature", True),
+    )
 
 
 def run_multi_model_eval(
@@ -200,13 +262,11 @@ def run_multi_model_eval(
     """
     Evaluate every model in `models` (default: all of PROVIDERS) on the SAME
     stratified sample of n posts -- same seed, so every model sees identical
-    posts, which is what makes the cross-model comparison fair.
+    posts, which is what makes the cross-model comparison fair, even when
+    different team members run different models on different machines.
 
-    Saves one CSV per model plus a combined long-format CSV
-    (results/tables/multi_llm_all_results.csv) with a 'model' and 'family'
-    column, ready for a groupby comparison. Interrupt-safe per model: hitting
-    stop partway through a model saves what that model has completed so far
-    and moves on cleanly (nothing already paid for is lost).
+    Saves one CSV per model plus a combined long-format CSV. Interrupt-safe
+    per model: stopping partway through a model saves what's done so far.
     """
     load_dotenv()
     models = models or list(PROVIDERS.keys())
@@ -224,22 +284,26 @@ def run_multi_model_eval(
     for model_key in models:
         cfg = PROVIDERS[model_key]
         print(f"\n{'=' * 60}\n{model_key}  ({cfg['family']})\n{'=' * 60}")
-        try:
-            client = get_client_for(model_key)
-        except RuntimeError as e:
-            print(f"  SKIPPING {model_key}: {e}")
+
+        openai_client = None
+        if cfg["type"] == "openai_compat":
+            try:
+                openai_client = get_openai_client_for(model_key)
+            except RuntimeError as e:
+                print(f"  SKIPPING {model_key}: {e}")
+                continue
+        elif cfg["type"] == "vertex" and not os.environ.get(cfg["api_key_env"]):
+            print(f"  SKIPPING {model_key}: {cfg['api_key_env']} not set in .env")
             continue
 
-        safe_name = model_key.replace(":", "_").replace(".", "_")
+        safe_name = model_key.replace(":", "_").replace(".", "_").replace("/", "_")
         model_output_path = f"{output_dir}/multi_llm_{safe_name}.csv"
 
         results = []
         rows = list(sample.itertuples(index=False))
 
-        def classify_one(row, _model=model_key, _client=client, _use_json=cfg["use_json_mode"]):
-            label, rationale, in_tok, out_tok = classify_post_universal(
-                _client, _model, row.statement, use_json_mode=_use_json
-            )
+        def classify_one(row, _model=model_key, _client=openai_client):
+            label, rationale, in_tok, out_tok = classify_post_dispatch(_model, row.statement, openai_client=_client)
             return {
                 "model": _model, "family": cfg["family"],
                 "statement": row.statement, "true_label": row.status,
@@ -259,7 +323,7 @@ def run_multi_model_eval(
                         pd.DataFrame(results).to_csv(model_output_path, index=False)
         except KeyboardInterrupt:
             print(f"\n  Interrupted during {model_key} after {len(results)}/{len(rows)} -- "
-                  f"saved what's done, moving on is your call (re-run to retry this model).")
+                  f"saved what's done (re-run to retry this model).")
         finally:
             if results:
                 pd.DataFrame(results).to_csv(model_output_path, index=False)
@@ -271,6 +335,34 @@ def run_multi_model_eval(
     combined_path = f"{output_dir}/multi_llm_all_results.csv"
     combined.to_csv(combined_path, index=False)
     print(f"\nSaved combined results ({len(combined)} rows total) to {combined_path}")
+    return combined
+
+
+def combine_saved_results(models: list = None, output_dir: str = "results/tables") -> pd.DataFrame:
+    """Combine already-saved per-model CSVs (produced by team members running
+    independently on different machines) into one DataFrame, WITHOUT
+    re-running anything. This works because everyone uses the same seed on
+    the same test.csv, so the sample is identical everywhere."""
+    models = models or list(PROVIDERS.keys())
+    frames = []
+    for model_key in models:
+        safe_name = model_key.replace(":", "_").replace(".", "_").replace("/", "_")
+        path = f"{output_dir}/multi_llm_{safe_name}.csv"
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            frames.append(df)
+            print(f"  Loaded {len(df)} rows for {model_key} from {path}")
+        else:
+            print(f"  MISSING: {path} -- {model_key} hasn't been run/pulled yet, skipping")
+    if not frames:
+        raise FileNotFoundError(f"No per-model result files found in {output_dir}/ -- try `git pull` first.")
+    combined = pd.concat(frames, ignore_index=True)
+    combined_path = f"{output_dir}/multi_llm_all_results.csv"
+    combined.to_csv(combined_path, index=False)
+    print(f"\nCombined {len(combined)} rows total -> {combined_path}")
+    missing = [m for m in models if m not in combined["model"].unique()]
+    if missing:
+        print(f"\nStill waiting on: {missing}")
     return combined
 
 
@@ -293,53 +385,11 @@ def report_multi_model_metrics(combined_df: pd.DataFrame) -> pd.DataFrame:
     return result_df
 
 
-def combine_saved_results(models: list = None, output_dir: str = "results/tables") -> pd.DataFrame:
-    """
-    Combine already-saved per-model CSVs into one combined DataFrame WITHOUT
-    re-running anything. Use this after team members have each independently
-    run a different subset of models on their own machines (e.g. Promitee ran
-    the OpenAI models, Maha ran Gemini, Sadman ran the local model on his
-    dad's machine) and pushed their results/tables/multi_llm_*.csv files.
-
-    This works correctly because every person calls run_multi_model_eval()
-    with the SAME seed (42) and the SAME test.csv (already shared via git) --
-    so stratified_sample() deterministically produces the IDENTICAL 500 posts
-    on every machine, with no coordination needed beyond everyone using the
-    defaults. Nobody needs to send the sampled subset to anyone else first.
-    """
-    models = models or list(PROVIDERS.keys())
-    frames = []
-    for model_key in models:
-        safe_name = model_key.replace(":", "_").replace(".", "_")
-        path = f"{output_dir}/multi_llm_{safe_name}.csv"
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            frames.append(df)
-            print(f"  Loaded {len(df)} rows for {model_key} from {path}")
-        else:
-            print(f"  MISSING: {path} -- {model_key} hasn't been run/pulled yet, skipping")
-    if not frames:
-        raise FileNotFoundError(
-            "No per-model result files found in "
-            f"{output_dir}/ -- has anyone pushed their results yet? "
-            "Try `git pull` first."
-        )
-    combined = pd.concat(frames, ignore_index=True)
-    combined_path = f"{output_dir}/multi_llm_all_results.csv"
-    combined.to_csv(combined_path, index=False)
-    print(f"\nCombined {len(combined)} rows total -> {combined_path}")
-
-    missing = [m for m in models if m not in combined["model"].unique()]
-    if missing:
-        print(f"\nStill waiting on: {missing}")
-    return combined
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True)
     parser.add_argument("--n", type=int, default=500)
-    parser.add_argument("--models", nargs="*", default=None, help="Subset of PROVIDERS keys; default = all")
+    parser.add_argument("--models", nargs="*", default=None)
     parser.add_argument("--max-workers", type=int, default=10)
     args = parser.parse_args()
 
