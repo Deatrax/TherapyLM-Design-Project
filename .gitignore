@@ -1,0 +1,33 @@
+# --- Secrets: NEVER commit the API key ---
+.env
+
+# --- Data: keep raw/processed posts out of the repo (privacy + licence) ---
+data/raw/
+data/processed/
+
+# --- Trained model binaries (large, regenerable) ---
+models/rf.joblib
+
+
+
+# --- Unnecessary Docs that do not need to be committed ---
+docs/IMPLEMENTATION.md
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+# NOTE: notebooks/*.ipynb themselves ARE committed (that's where the work lives).
+# Always clear outputs before committing -- see docs/IMPLEMENTATION.md §2.5.
+# If you ever want to enforce this automatically, nbstripout is the standard
+# tool (pip install nbstripout && nbstripout --install), but it's optional.
+
+# --- OS / editor noise ---
+.DS_Store
+.vscode/
+.idea/
