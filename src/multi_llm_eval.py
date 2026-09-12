@@ -332,9 +332,18 @@ def run_multi_model_eval(
         all_results.extend(results)
 
     combined = pd.DataFrame(all_results)
-    combined_path = f"{output_dir}/multi_llm_all_results.csv"
-    combined.to_csv(combined_path, index=False)
-    print(f"\nSaved combined results ({len(combined)} rows total) to {combined_path}")
+    # NOTE: deliberately NOT writing results/tables/multi_llm_all_results.csv here.
+    # This function gets called independently by 3a/3b/3c, each with only a
+    # SUBSET of models -- if every one of those partial runs wrote to the same
+    # shared filename, every team member's branch would produce a different,
+    # unrelated file at that path, causing an unresolvable git add/add conflict
+    # the moment two branches merge (this already happened once). The one true
+    # "all results" file only gets written by combine_saved_results() in
+    # 04_combine_and_compare.ipynb, AFTER everyone's per-model CSVs (which ARE
+    # uniquely named and merge cleanly) have been merged together.
+    print(f"\n{len(combined)} rows classified this run (not written to a shared "
+          f"file -- see per-model CSVs above, and run 04_combine_and_compare.ipynb "
+          f"after merging for the real combined file).")
     return combined
 
 
@@ -366,9 +375,39 @@ def combine_saved_results(models: list = None, output_dir: str = "results/tables
     return combined
 
 
-def report_multi_model_metrics(combined_df: pd.DataFrame) -> pd.DataFrame:
-    """Per-model accuracy/macro-F1/weighted-F1, sorted best-to-worst by macro-F1."""
+def per_class_report_df(y_true, y_pred, labels=CATEGORIES) -> pd.DataFrame:
+    """Precision/recall/F1/support for each class, as a tidy DataFrame -- the
+    structured version of what classification_report() prints as text."""
+    report = classification_report(y_true, y_pred, labels=labels, output_dict=True, zero_division=0)
+    rows = [
+        {"class": cls, "precision": report[cls]["precision"], "recall": report[cls]["recall"],
+         "f1": report[cls]["f1-score"], "support": report[cls]["support"]}
+        for cls in labels
+    ]
+    return pd.DataFrame(rows)
+
+
+def report_multi_model_metrics(combined_df: pd.DataFrame, output_dir: str = "results/tables", save: bool = True) -> pd.DataFrame:
+    """
+    Per-model accuracy/macro-F1/weighted-F1, sorted best-to-worst by macro-F1.
+    Also computes the per-class breakdown for every model -- this works
+    directly on the true_label/predicted_label columns already in
+    combined_df, so it needs no new API calls even on results from a run
+    that finished earlier.
+
+    save=True writes:
+        results/tables/multi_llm_metrics_summary.csv     one row per model (aggregate)
+        results/tables/multi_llm_metrics_per_class.csv    one row per model x class
+
+    IMPORTANT: pass save=False when calling this from your OWN family
+    notebook (3a/3b/3c) on just your subset of models -- these are fixed
+    filenames, so if every team member's partial run saved to them, you'd
+    get the same git add/add conflict multi_llm_all_results.csv already
+    caused. Only 04_combine_and_compare.ipynb, running on everyone's
+    already-merged results, should actually save these.
+    """
     rows = []
+    per_class_frames = []
     for model, group in combined_df.groupby("model"):
         valid = group.dropna(subset=["predicted_label"])
         if valid.empty:
@@ -380,9 +419,79 @@ def report_multi_model_metrics(combined_df: pd.DataFrame) -> pd.DataFrame:
             "model": model, "family": group["family"].iloc[0], "n": len(valid),
             "accuracy": acc, "macro_f1": macro, "weighted_f1": weighted,
         })
+        pc = per_class_report_df(valid["true_label"], valid["predicted_label"])
+        pc.insert(0, "model", model)
+        pc.insert(1, "family", group["family"].iloc[0])
+        per_class_frames.append(pc)
+
     result_df = pd.DataFrame(rows).sort_values("macro_f1", ascending=False).reset_index(drop=True)
     print(result_df.to_string(index=False))
+
+    if not save:
+        print("\n(save=False -- not writing multi_llm_metrics_summary/per_class.csv; "
+              "this is expected for a per-family notebook run on a subset of models.)")
+        return result_df
+
+    os.makedirs(output_dir, exist_ok=True)
+    result_df.to_csv(f"{output_dir}/multi_llm_metrics_summary.csv", index=False)
+
+    per_class_df = pd.concat(per_class_frames, ignore_index=True) if per_class_frames else pd.DataFrame()
+    per_class_df.to_csv(f"{output_dir}/multi_llm_metrics_per_class.csv", index=False)
+    print(f"\nSaved {output_dir}/multi_llm_metrics_summary.csv and multi_llm_metrics_per_class.csv")
+
     return result_df
+
+
+def add_classical_ml_predictions(combined_df: pd.DataFrame, models_dir: str = "models") -> pd.DataFrame:
+    """
+    Re-evaluates the already-trained SVM and Random Forest (from Step 2) on
+    the exact same posts the LLMs were evaluated on, and appends their
+    predictions to combined_df in the same long-format schema -- so SVM, RF,
+    and every LLM across all 3 families end up in ONE dataframe you can run
+    report_multi_model_metrics() on together. No retraining, no new API
+    calls -- this only predicts on posts already sitting in combined_df.
+
+    This replaces the old standalone shared_subset_compare.py -- since this
+    notebook already has the shared 500-post LLM data in hand, adding
+    classical ML here avoids loading it twice. shared_subset_compare.py is
+    no longer used anywhere and can be deleted.
+
+    Note: `models/rf.joblib` was too large to commit to git and was shared
+    via Drive instead -- if it's missing on whoever runs this, Random Forest
+    is skipped with a warning rather than crashing, so you still get SVM +
+    every LLM either way.
+    """
+    import joblib
+
+    posts = combined_df.drop_duplicates(subset=["statement"])[["statement", "true_label"]].reset_index(drop=True)
+    print(f"Re-evaluating classical ML on the same {len(posts)} posts every LLM saw...")
+
+    vectorizer = joblib.load(f"{models_dir}/tfidf_vectorizer.joblib")
+    X = vectorizer.transform(posts["statement"])
+
+    classical_models = {"SVM (LinearSVC)": f"{models_dir}/svm.joblib"}
+    rf_path = f"{models_dir}/rf.joblib"
+    if os.path.exists(rf_path):
+        classical_models["Random Forest"] = rf_path
+    else:
+        print(f"  NOTE: {rf_path} not found (it's Drive-shared, not git-committed) -- "
+              f"skipping Random Forest, SVM + all LLMs still proceed normally.")
+
+    rows = []
+    for name, path in classical_models.items():
+        model = joblib.load(path)
+        preds = model.predict(X)
+        for statement, true_label, pred in zip(posts["statement"], posts["true_label"], preds):
+            rows.append({
+                "model": name, "family": "Classical ML",
+                "statement": statement, "true_label": true_label,
+                "predicted_label": pred, "rationale": None,
+                "in_tokens": None, "out_tokens": None,
+            })
+        print(f"  Added {name} ({len(posts)} predictions)")
+
+    classical_df = pd.DataFrame(rows)
+    return pd.concat([combined_df, classical_df], ignore_index=True)
 
 
 def main():
