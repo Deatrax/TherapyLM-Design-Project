@@ -133,8 +133,8 @@ Run in order:
 | Member | Contribution |
 |---|---|
 | Sadman | Data cleaning, classical ML training, local (LM Studio) LLM family evaluation, repository coordination |
-| Promitee | OpenAI family LLM evaluation |
-| Maha | Google Gemini family LLM evaluation, explainability analysis, presentation |
+| Promitee | OpenAI family LLM evaluation, Model comparisons |
+| Maha | Google Gemini family LLM evaluation, explainability analysis |
 
 ## Results
 
