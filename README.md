@@ -84,7 +84,9 @@ TherapyLM-Design-Project/
 │   ├── clean_data.py              # dataset loading & cleaning
 │   ├── train_classical.py         # TF-IDF + SVM/RF/XGBoost training & evaluation
 │   ├── multi_llm_eval.py          # multi-family LLM evaluation engine
-│   └── explainability.py          # SHAP / LIME / SVM coefficient analysis
+│   ├── explainability.py          # SHAP / LIME / SVM coefficient analysis
+│   ├── llm_zero_shot_eval.py      # shared LLM eval helpers (categories, sampling, OpenAI client)
+│   └── shared_subset_compare.py   # utilities for comparing models on the shared sample
 ├── notebooks/
 │   ├── 01_data_cleaning_eda.ipynb
 │   ├── 02_train_classical_models.ipynb
@@ -94,7 +96,7 @@ TherapyLM-Design-Project/
 │   ├── 04_combine_and_compare.ipynb   # unifies all results, produces final comparison
 │   └── 05_explainability.ipynb
 ├── requirements.txt
-└── .env.example
+└── env.example
 ```
 
 ## Setup
@@ -103,13 +105,13 @@ TherapyLM-Design-Project/
    ```bash
    pip install -r requirements.txt
    ```
-2. Copy `.env.example` to `.env` and fill in:
+2. Copy `env.example` to `.env` and fill in:
    - `OPENAI_API_KEY` — for the OpenAI family
    - `GOOGLE_VERTEX_API_KEY` — for the Gemini family (Vertex AI project)
 3. For the local model family, install [LM Studio](https://lmstudio.ai),
    load the target models, and start its local server. Update
-   `LM_STUDIO_BASE_URL` in `src/multi_llm_eval.py` if it isn't running on
-   the default address.
+   `LM_STUDIO_BASE_URL` in `src/multi_llm_eval.py` to point at the machine
+   actually running LM Studio.
 4. Download the dataset manually from Kaggle and place it under
    `data/raw/` (not redistributed in this repo).
 
