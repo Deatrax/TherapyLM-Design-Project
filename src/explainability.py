@@ -105,12 +105,18 @@ def lime_example(vectorizer, xgb, label_encoder, texts, out_dir="results/figures
 
 def load_artifacts(models_dir="models"):
     """Convenience loader: pulls everything Sadman saved in Step 2."""
-    return {
+    artifacts = {
         "vectorizer": joblib.load(f"{models_dir}/tfidf_vectorizer.joblib"),
         "svm": joblib.load(f"{models_dir}/svm.joblib"),
-        "xgb": joblib.load(f"{models_dir}/xgb.joblib"),
         "label_encoder": joblib.load(f"{models_dir}/label_encoder.joblib"),
     }
+    try:
+        artifacts["xgb"] = joblib.load(f"{models_dir}/xgb.joblib")
+    except Exception as e:
+        print(f"  NOTE: could not load xgb.joblib ({type(e).__name__}: {e}) -- skipping. "
+              f"Not used anywhere in SVM/SHAP/LIME explainability, so this is safe to ignore.")
+        artifacts["xgb"] = None
+    return artifacts
 
 
 def main():
